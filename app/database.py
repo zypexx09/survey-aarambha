@@ -1,9 +1,50 @@
-import sqlite3
 import os
 import json
 from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, select, func
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "survey.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///survey.db")
+# Fix postgres:// URI for SQLAlchemy 1.4+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# SQLite needs specific connect_args for threads
+engine_kwargs = {}
+if "sqlite" in DATABASE_URL:
+    # Get absolute path for sqlite if it's the default
+    if DATABASE_URL == "sqlite:///survey.db":
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "survey.db")
+        DATABASE_URL = f"sqlite:///{db_path}"
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **engine_kwargs)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class Question(Base):
+    __tablename__ = "questions"
+    id = Column(Integer, primary_key=True, index=True)
+    section = Column(String, nullable=False)
+    question_text = Column(Text, nullable=False)
+    question_type = Column(String, nullable=False)
+    options = Column(Text) # JSON string
+
+class SurveySession(Base):
+    __tablename__ = "sessions"
+    session_id = Column(String, primary_key=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed = Column(Integer, default=0)
+    student_name = Column(String)
+    student_grade = Column(Integer)
+    student_section = Column(String)
+
+class Response(Base):
+    __tablename__ = "responses"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String, ForeignKey("sessions.session_id", ondelete="CASCADE"))
+    question_id = Column(Integer, ForeignKey("questions.id", ondelete="CASCADE"))
+    answer_text = Column(Text)
 
 DEFAULT_QUESTIONS = [
     # Section A
@@ -65,236 +106,149 @@ DEFAULT_QUESTIONS = [
     (25, "E", "Is there anything you would like your teacher to know about how you feel in class, or what would help you thrive?", "open", None)
 ]
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Create questions table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS questions (
-            id INTEGER PRIMARY KEY,
-            section TEXT NOT NULL,
-            question_text TEXT NOT NULL,
-            question_type TEXT NOT NULL,
-            options TEXT -- JSON string of choices
-        );
-    """)
-
-    # Create sessions table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed INTEGER DEFAULT 0,
-            student_name TEXT,
-            student_grade INTEGER,
-            student_section TEXT
-        );
-    """)
-    
-    # Create responses table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS responses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            question_id INTEGER,
-            answer_text TEXT,
-            FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE,
-            FOREIGN KEY (question_id) REFERENCES questions (id) ON DELETE CASCADE
-        );
-    """)
-    
-    conn.commit()
-
-    # Pre-seed initial 25 questions if empty
-    cursor.execute("SELECT COUNT(*) FROM questions")
-    count = cursor.fetchone()[0]
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    count = db.query(Question).count()
     if count == 0:
         print("Pre-seeding default 25 questions into database...")
-        cursor.executemany(
-            "INSERT INTO questions (id, section, question_text, question_type, options) VALUES (?, ?, ?, ?, ?)",
-            DEFAULT_QUESTIONS
-        )
-        conn.commit()
-
-    conn.close()
+        for q in DEFAULT_QUESTIONS:
+            db.add(Question(id=q[0], section=q[1], question_text=q[2], question_type=q[3], options=q[4]))
+        db.commit()
+    db.close()
 
 def create_session(session_id: str, student_name: str, student_grade: int, student_section: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    db = SessionLocal()
     try:
-        cursor.execute(
-            """INSERT OR REPLACE INTO sessions 
-               (session_id, created_at, completed, student_name, student_grade, student_section) 
-               VALUES (?, ?, 0, ?, ?, ?)""",
-            (session_id, datetime.utcnow().isoformat(), student_name, student_grade, student_section)
-        )
-        conn.commit()
+        # Check if exists (ON CONFLICT DO UPDATE equivalent)
+        session = db.query(SurveySession).filter_by(session_id=session_id).first()
+        if session:
+            session.student_name = student_name
+            session.student_grade = student_grade
+            session.student_section = student_section
+        else:
+            session = SurveySession(
+                session_id=session_id,
+                student_name=student_name,
+                student_grade=student_grade,
+                student_section=student_section
+            )
+            db.add(session)
+        db.commit()
     finally:
-        conn.close()
+        db.close()
 
 def complete_session(session_id: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    db = SessionLocal()
     try:
-        cursor.execute(
-            "UPDATE sessions SET completed = 1 WHERE session_id = ?",
-            (session_id,)
-        )
-        conn.commit()
+        session = db.query(SurveySession).filter_by(session_id=session_id).first()
+        if session:
+            session.completed = 1
+            db.commit()
     finally:
-        conn.close()
+        db.close()
 
 def save_response(session_id: str, question_id: int, answer_text: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    db = SessionLocal()
     try:
-        cursor.execute(
-            "SELECT id FROM responses WHERE session_id = ? AND question_id = ?",
-            (session_id, question_id)
-        )
-        row = cursor.fetchone()
-        if row:
-            cursor.execute(
-                "UPDATE responses SET answer_text = ? WHERE id = ?",
-                (answer_text, row['id'])
-            )
+        response = db.query(Response).filter_by(session_id=session_id, question_id=question_id).first()
+        if response:
+            response.answer_text = answer_text
         else:
-            cursor.execute(
-                "INSERT INTO responses (session_id, question_id, answer_text) VALUES (?, ?, ?)",
-                (session_id, question_id, answer_text)
-            )
-        conn.commit()
+            response = Response(session_id=session_id, question_id=question_id, answer_text=answer_text)
+            db.add(response)
+        db.commit()
     finally:
-        conn.close()
+        db.close()
 
 def get_questions_from_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    db = SessionLocal()
     try:
-        cursor.execute("SELECT id, section, question_text, question_type, options FROM questions ORDER BY id")
-        rows = cursor.fetchall()
+        questions = db.query(Question).order_by(Question.id).all()
         result = {}
-        for row in rows:
-            opt_str = row['options']
-            result[row['id']] = {
-                "id": row['id'],
-                "section": row['section'],
-                "text": row['question_text'],
-                "type": row['question_type'],
-                "options": json.loads(opt_str) if opt_str else None
+        for q in questions:
+            result[q.id] = {
+                "id": q.id,
+                "section": q.section,
+                "text": q.question_text,
+                "type": q.question_type,
+                "options": json.loads(q.options) if q.options else None
             }
         return result
     finally:
-        conn.close()
+        db.close()
 
 def update_question_in_db(q_id: int, text: str, options: dict = None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    db = SessionLocal()
     try:
-        opt_str = json.dumps(options) if options else None
-        cursor.execute(
-            "UPDATE questions SET question_text = ?, options = ? WHERE id = ?",
-            (text, opt_str, q_id)
-        )
-        conn.commit()
+        q = db.query(Question).filter_by(id=q_id).first()
+        if q:
+            q.question_text = text
+            q.options = json.dumps(options) if options else None
+            db.commit()
     finally:
-        conn.close()
+        db.close()
 
 def get_completed_sessions_count(grade: int = None, section: str = None) -> int:
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    db = SessionLocal()
     try:
-        query = "SELECT COUNT(*) FROM sessions WHERE completed = 1"
-        params = []
+        query = db.query(SurveySession).filter_by(completed=1)
         if grade is not None:
-            query += " AND student_grade = ?"
-            params.append(grade)
+            query = query.filter_by(student_grade=grade)
         if section is not None and section.strip() != "":
-            query += " AND UPPER(student_section) = UPPER(?)"
-            params.append(section.strip())
-            
-        cursor.execute(query, params)
-        return cursor.fetchone()[0]
+            query = query.filter(func.upper(SurveySession.student_section) == func.upper(section.strip()))
+        return query.count()
     finally:
-        conn.close()
+        db.close()
 
 def get_all_completed_responses(grade: int = None, section: str = None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    db = SessionLocal()
     try:
-        query = """
-            SELECT r.question_id, r.answer_text, r.session_id
-            FROM responses r
-            JOIN sessions s ON r.session_id = s.session_id
-            WHERE s.completed = 1
-        """
-        params = []
+        query = db.query(Response, SurveySession).join(SurveySession, Response.session_id == SurveySession.session_id).filter(SurveySession.completed == 1)
+        
         if grade is not None:
-            query += " AND s.student_grade = ?"
-            params.append(grade)
+            query = query.filter(SurveySession.student_grade == grade)
         if section is not None and section.strip() != "":
-            query += " AND UPPER(s.student_section) = UPPER(?)"
-            params.append(section.strip())
+            query = query.filter(func.upper(SurveySession.student_section) == func.upper(section.strip()))
             
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
+        rows = query.all()
+        return [{"question_id": r.Response.question_id, "answer_text": r.Response.answer_text, "session_id": r.Response.session_id} for r in rows]
     finally:
-        conn.close()
+        db.close()
 
 def get_detailed_submissions(grade: int = None, section: str = None):
-    """
-    Returns lists of all submissions with Name, Grade, Section, Date,
-    and their mapped question responses.
-    """
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    db = SessionLocal()
     try:
-        query = """
-            SELECT session_id, created_at, student_name, student_grade, student_section
-            FROM sessions
-            WHERE completed = 1
-        """
-        params = []
-        if grade is not None:
-            query += " AND student_grade = ?"
-            params.append(grade)
-        if section is not None and section.strip() != "":
-            query += " AND UPPER(student_section) = UPPER(?)"
-            params.append(section.strip())
-            
-        query += " ORDER BY created_at DESC"
+        query = db.query(SurveySession).filter_by(completed=1)
         
-        cursor.execute(query, params)
-        sessions_rows = cursor.fetchall()
+        if grade is not None:
+            query = query.filter_by(student_grade=grade)
+        if section is not None and section.strip() != "":
+            query = query.filter(func.upper(SurveySession.student_section) == func.upper(section.strip()))
+            
+        query = query.order_by(SurveySession.created_at.desc())
+        sessions = query.all()
         
         submissions = []
-        for s_row in sessions_rows:
-            s_id = s_row['session_id']
-            cursor.execute("""
-                SELECT question_id, answer_text 
-                FROM responses 
-                WHERE session_id = ?
-            """, (s_id,))
-            resp_rows = cursor.fetchall()
-            
-            answers = {r['question_id']: r['answer_text'] for r in resp_rows}
+        for s in sessions:
+            responses = db.query(Response).filter_by(session_id=s.session_id).all()
+            answers = {r.question_id: r.answer_text for r in responses}
             submissions.append({
-                "session_id": s_id,
-                "created_at": s_row['created_at'],
-                "student_name": s_row['student_name'],
-                "student_grade": s_row['student_grade'],
-                "student_section": s_row['student_section'],
+                "session_id": s.session_id,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "student_name": s.student_name,
+                "student_grade": s.student_grade,
+                "student_section": s.student_section,
                 "answers": answers
             })
             
         return submissions
     finally:
-        conn.close()
+        db.close()
