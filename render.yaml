@@ -7,9 +7,4 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.0
-      - key: DB_PATH
-        value: /data/survey.db
-    disk:
-      name: sqlite-data
-      mountPath: /data
-      sizeGB: 1
+
